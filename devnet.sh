@@ -178,7 +178,7 @@ filebeat.inputs:
 - type: log
   enabled: true
   paths:
-    - ${currentDir}/devnet/dusk_data/logs/dusk$((7100+$i)).log
+    - ${currentDir}/devnet/dusk_data/logs/dusk${i}.log
   exclude_files: ['\.gz$']
   encoding: plain
   json.keys_under_root: true
