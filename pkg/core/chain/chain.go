@@ -88,9 +88,8 @@ type Chain struct {
 	lastCertificate *block.Certificate
 	pubKey          *keys.PublicKey
 
-	// Consensus context, used to cancel the loop.
-	consensusCtx context.Context
-	interrupt    context.CancelFunc
+	// Loop interrupt
+	interrupt chan struct{}
 
 	// Consensus loop
 	loop      *loop.Consensus
@@ -114,6 +113,7 @@ func New(ctx context.Context, db database.DB, eventBus *eventbus.EventBus, rpcBu
 		loader:    loader,
 		verifier:  verifier,
 		proxy:     proxy,
+		interrupt: make(chan struct{}),
 		ctx:       ctx,
 		requestor: requestor,
 	}
@@ -177,6 +177,15 @@ func (c *Chain) SetupConsensus(pk keys.PublicKey, l *loop.Consensus) {
 	}
 }
 
+// Non-blocking send to interrupt channel. Signal should kill a running loop,
+// but otherwise be ignored.
+func (c *Chain) interrupt() {
+	select {
+	case c.interrupt <- struct{}{}:
+	default:
+	}
+}
+
 // ProcessBlock will handle blocks incoming from the network. It will allow
 // the chain to enter sync mode if it detects that we are behind, which will
 // cancel the running consensus loop and attempt to reach the new chain tip.
@@ -198,11 +207,8 @@ func (c *Chain) ProcessBlock(m message.Message) ([]bytes.Buffer, error) {
 	}
 
 	// If we are more than one block behind, stop the consensus
-	log.Debug("topics.StopConsensus")
-	// FIXME: this call should be blocking
-	if c.interrupt != nil {
-		c.interrupt()
-	}
+	log.Debug("interrupting chain loop")
+	c.interrupt()
 
 	// If this block is from far in the future, we should start syncing mode.
 	if blk.Header.Height > c.tip.Header.Height+1 {
@@ -374,34 +380,44 @@ func (c *Chain) AcceptBlock(ctx context.Context, blk block.Block) error {
 }
 
 func (c *Chain) startConsensus() error {
-	for {
-		c.lock.Lock()
-		ru := c.getRoundUpdate()
-		c.consensusCtx, c.interrupt = context.WithCancel(c.ctx)
-		scr, agr, err := loop.CreateStateMachine(c.loop.Emitter, c.db, config.ConsensusTimeOut, c.pubKey.Copy(), c.VerifyCandidateBlock, c.requestor)
-		if err != nil {
-			log.WithError(err).Error("could not create consensus state machine")
-			c.lock.Unlock()
-			return err
-		}
-
+	c.lock.Lock()
+	ru := c.getRoundUpdate()
+	consensusCtx, cancel := context.WithCancel(c.ctx)
+	scr, agr, err := loop.CreateStateMachine(c.loop.Emitter, c.db, config.ConsensusTimeOut, c.pubKey.Copy(), c.VerifyCandidateBlock, c.requestor)
+	if err != nil {
+		log.WithError(err).Error("could not create consensus state machine")
 		c.lock.Unlock()
-		cert, blockHash, err := c.loop.Spin(c.consensusCtx, scr, agr, ru)
-		if err != nil {
-			// This is likely because of the consensus reaching max steps.
-			// If this is the case, we simply propagate the error upwards.
-			// TODO: maybe figure out a way to respond to this kind of error.
-			return err
-		}
+		return err
+	}
 
-		// If the context was canceled, the results will be nil. Thus, we can
-		// break the loop and exit the function, to make place for the new one.
-		if cert == nil || blockHash == nil {
+	c.lock.Unlock()
+
+	for {
+		// The consensus needs to be running concurrently to the listening on
+		// channels. Otherwise, we can not catch the interrupt signal.
+		go func(ctx context.Context, scr consensus.Phase, agr consensus.Controller, ru consensus.RoundUpdate, resultsChan chan consensus.RoundResults) {
+			if err := c.loop.Spin(ctx, scr, agr, ru, resultsChan); err != nil {
+				// This is likely because of the consensus reaching max steps.
+				// If this is the case, we simply propagate the error upwards.
+				// TODO: maybe figure out a way to respond to this kind of error.
+				return err
+			}
+		}(consensusCtx, scr, agr, ru, c.resultsChan)
+
+		select {
+		case results := <-c.resultsChan:
+			// Cancel consensus ctx, now that it's finished. This doesn't affect
+			// the loop, but it cleans up the resources associated with the
+			// child context.
+			cancel()
+
+			if err := c.handleCertificateMessage(results.Cert, results.BlockHash); err != nil {
+				return err
+			}
+		case <-c.interrupt:
+			// Wrap up consensus
+			cancel()
 			return nil
-		}
-
-		if err := c.handleCertificateMessage(cert, blockHash); err != nil {
-			return err
 		}
 	}
 }

@@ -29,9 +29,9 @@ var lg = log.WithField("process", "consensus loop")
 // is highly asynchronous or we are under attack
 var ErrMaxStepsReached = errors.New("consensus reached max number of steps without moving forward")
 
-type roundResults struct {
-	cert *block.Certificate
-	hash []byte
+type RoundResults struct {
+	Cert *block.Certificate
+	Hash []byte
 }
 
 // Consensus is the state machine that runs the steps of consensus. Rather than
@@ -48,8 +48,8 @@ type Consensus struct {
 	eventChan     chan message.Message
 }
 
-// CreateStateMachine creates and link the steps in the consensus. It is kept separated from
-// consensus.New so to ease mocking the consensus up when testing
+// CreateStateMachine creates and link the steps in the consensus. It is kept
+// separated from consensus.New so to ease mocking the consensus up when testing.
 func CreateStateMachine(e *consensus.Emitter, db database.DB, consensusTimeOut time.Duration, pubKey *keys.PublicKey, verifyFn consensus.CandidateVerificationFunc, requestor *candidate.Requestor) (consensus.Phase, consensus.Controller, error) {
 	generator, err := blockgenerator.New(e, pubKey, db)
 	if err != nil {
@@ -62,7 +62,7 @@ func CreateStateMachine(e *consensus.Emitter, db database.DB, consensusTimeOut t
 }
 
 // CreateInitialStep creates the selection step by injecting a BlockGenerator
-// interface to it
+// interface to it.
 func CreateInitialStep(e *consensus.Emitter, consensusTimeOut time.Duration, bg blockgenerator.BlockGenerator, verifyFn consensus.CandidateVerificationFunc, db database.DB, requestor *candidate.Requestor) consensus.Phase {
 	redu2 := secondstep.New(e, consensusTimeOut)
 	redu1 := firststep.New(redu2, e, verifyFn, consensusTimeOut, db, requestor)
@@ -104,7 +104,7 @@ func New(e *consensus.Emitter) *Consensus {
 // Agreement loop (acting roundwise) runs concurrently with the generation-selection-reduction
 // loop (acting step-wise)
 // TODO: consider stopping the phase loop with a Done phase, instead of nil
-func (c *Consensus) Spin(ctx context.Context, scr consensus.Phase, ag consensus.Controller, round consensus.RoundUpdate) (*block.Certificate, []byte, error) {
+func (c *Consensus) Spin(ctx context.Context, scr consensus.Phase, ag consensus.Controller, round consensus.RoundUpdate, resultsChan chan RoundResults) error {
 	// we create two context cancelation from the same parent context. This way
 	// we can let the agreement interrupt the stateMachine's loop cycle.
 	// Similarly, the loop can invoke the Agreement cancelation if it throws
@@ -116,10 +116,6 @@ func (c *Consensus) Spin(ctx context.Context, scr consensus.Phase, ag consensus.
 	agrCtx, cancelAgreement := context.WithCancel(stepCtx)
 	defer cancelAgreement()
 
-	// We create a channel on which to communicate round results, so that they
-	// can be returned to the caller on a successful completion.
-	roundResultsChan := make(chan roundResults, 1)
-
 	// the agreement loop needs to be running until either the consensus
 	// reaches a maximum amount of iterations (approx. 213 steps), or we get
 	// agreements from future rounds and stopped receiving them for the current round
@@ -127,7 +123,12 @@ func (c *Consensus) Spin(ctx context.Context, scr consensus.Phase, ag consensus.
 	go func() {
 		agreementLoop := ag.GetControlFn()
 		cert, blockHash := agreementLoop(agrCtx, c.roundQueue, c.agreementChan, round)
-		roundResultsChan <- roundResults{cert, blockHash}
+
+		// Attempt an unblocked send with the results
+		select {
+		case resultsChan <- RoundResults{cert, blockHash}:
+		default:
+		}
 		// canceling the consensus phase loop when Agreement is done (either
 		// because the parent canceled or because a consensus has been reached)
 		finalizeStep()
@@ -147,14 +148,7 @@ func (c *Consensus) Spin(ctx context.Context, scr consensus.Phase, ag consensus.
 					"step":  step,
 				}).
 				Trace("consensus achieved")
-
-			// Take round results from the agreement goroutine
-			select {
-			case results := <-roundResultsChan:
-				return results.cert, results.hash, nil
-			default:
-				return nil, nil, nil
-			}
+			return nil
 		}
 
 		lg.
@@ -176,7 +170,7 @@ func (c *Consensus) Spin(ctx context.Context, scr consensus.Phase, ag consensus.
 					"step":  step,
 				}).
 				Error("max steps reached")
-			return nil, nil, ErrMaxStepsReached
+			return ErrMaxStepsReached
 		}
 	}
 
